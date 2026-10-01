@@ -4,11 +4,16 @@ Integrated Single-File Streamlit Application
 """
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, Iterator, Optional
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+
+try:
+    from openai import OpenAI
+except ImportError:  # keeps the dashboard working if the package is missing
+    OpenAI = None
 
 # -----------------------------------------------------------------------------
 # 1. CONSTANTS & LOOKUPS
@@ -39,6 +44,55 @@ SEX_COLORS = {
     "Female": "#2b5c8f",
     "Male": "#d95f02",
 }
+
+# AI assistant settings
+LLM_PROVIDERS = {
+    "gsk_": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "openai/gpt-oss-120b",
+        "fallback_models": [
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.8-27b",
+            "llama-3.3-70b-versatile",
+        ],
+    },
+    "xai-": {
+        "name": "xAI (Grok)",
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-3-mini",
+        "fallback_models": [],
+    },
+}
+
+API_KEY_SECRET_NAMES = ("GROQ_API_KEY", "GROK_API_KEY", "XAI_API_KEY", "LLM_API_KEY")
+MODEL_SECRET_NAME = "LLM_MODEL"
+
+SUGGESTED_QUESTIONS = [
+    "Which 3 states had the most births?",
+    "Which month had the fewest births, and why might that be?",
+    "What is the male-to-female ratio in the current selection?",
+]
+
+MAX_HISTORY_MESSAGES = 6
+LLM_TEMPERATURE = 0.2
+LLM_MAX_TOKENS = 2000  # gpt-oss is a reasoning model and spends tokens "thinking"
+
+MODEL_UNAVAILABLE_PHRASES = (
+    "not found",
+    "decommissioned",
+    "deprecated",
+    "does not exist",
+    "not available",
+    "model_not_found",
+    "model_decommissioned",
+)
+
+EMPTY_REPLY_MESSAGE = "The model returned an empty answer. Please try rephrasing your question."
+NONE_AVAILABLE_MESSAGE = (
+    "None of the configured AI models are available. Add a LLM_MODEL secret in Streamlit Cloud "
+    "(⋮ → Settings → Secrets) with the name of a model that is currently available for your API key."
+)
 
 # -----------------------------------------------------------------------------
 # 2. PAGE CONFIGURATION
@@ -359,7 +413,302 @@ def plot_state_month_heatmap(filtered_df: pd.DataFrame) -> go.Figure:
     return fig
 
 # -----------------------------------------------------------------------------
-# 6. MAIN APPLICATION EXECUTION
+# 6. AI DATA ASSISTANT (CHATBOT)
+# -----------------------------------------------------------------------------
+
+class AllModelsUnavailableError(Exception):
+    """Raised when every configured model is retired, unknown or unavailable."""
+
+
+def get_llm_api_key() -> Optional[str]:
+    """Return the first API key found in Streamlit secrets (never hard-coded)."""
+    for name in API_KEY_SECRET_NAMES:
+        try:
+            value = st.secrets[name]
+        except Exception:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def get_model_override() -> Optional[str]:
+    """Return the optional LLM_MODEL secret, if present."""
+    try:
+        value = st.secrets[MODEL_SECRET_NAME]
+    except Exception:
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def resolve_llm_config(api_key: str) -> Optional[Dict[str, Any]]:
+    """Detect the provider from the key prefix and build the connection settings."""
+    for prefix, provider in LLM_PROVIDERS.items():
+        if api_key.startswith(prefix):
+            primary = get_model_override() or provider["default_model"]
+            models = [primary] + [m for m in provider["fallback_models"] if m != primary]
+            return {
+                "provider": provider["name"],
+                "base_url": provider["base_url"],
+                "api_key": api_key,
+                "models": models,
+            }
+    return None
+
+
+def get_active_model(config: Dict[str, Any]) -> str:
+    """Model shown in the UI: the one that last worked, else the configured primary."""
+    active = st.session_state.get("active_model")
+    return active if active in config["models"] else config["models"][0]
+
+
+def is_model_unavailable_error(err: Exception) -> bool:
+    """True only for errors meaning the model is retired, unknown or unavailable."""
+    # Auth and rate-limit problems are never a reason to switch models.
+    if getattr(err, "status_code", None) in (401, 429):
+        return False
+    message = str(err).lower()
+    return any(phrase in message for phrase in MODEL_UNAVAILABLE_PHRASES)
+
+
+def build_data_summary(df: pd.DataFrame) -> str:
+    """Compact text summary of the filtered data (the raw CSV is never sent)."""
+    total_births = int(df["births"].sum())
+    sexes = sorted(df["sex_of_infant"].unique().tolist())
+    sex_label = "All" if len(sexes) > 1 else sexes[0]
+    num_geos = int(df["state_of_residence"].nunique())
+    num_months = int(df["month"].nunique())
+
+    by_sex = df.groupby("sex_of_infant")["births"].sum()
+    by_month = df.groupby("month", observed=True)["births"].sum()
+    by_state = df.pivot_table(
+        index="state_of_residence",
+        columns="sex_of_infant",
+        values="births",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    by_state["Total"] = by_state[sexes].sum(axis=1)
+    by_state = by_state.sort_values("Total", ascending=False, kind="mergesort")
+
+    lines = [
+        "ACTIVE FILTERS",
+        f"- Infant sex: {sex_label}",
+        f"- Geographies selected: {num_geos}",
+        f"- Months selected: {num_months}",
+        "",
+        f"TOTAL BIRTHS: {total_births:,}",
+        "",
+        "BIRTHS BY SEX",
+    ]
+    for sex in sexes:
+        lines.append(f"- {sex}: {int(by_sex[sex]):,}")
+    if "Female" in by_sex.index and "Male" in by_sex.index and by_sex["Female"] > 0:
+        ratio = 100 * by_sex["Male"] / by_sex["Female"]
+        lines.append(f"- Male births per 100 female births: {ratio:.1f}")
+
+    lines += ["", "BIRTHS BY MONTH"]
+    for month, value in by_month.items():
+        lines.append(f"- {month}: {int(value):,}")
+
+    lines += ["", "BIRTHS BY STATE (ranked high to low)", "Rank. State | Total | " + " | ".join(sexes)]
+    for rank, (state, row) in enumerate(by_state.iterrows(), start=1):
+        cells = [f"{int(row['Total']):,}"] + [f"{int(row[s]):,}" for s in sexes]
+        lines.append(f"{rank}. {state} | " + " | ".join(cells))
+
+    return "\n".join(lines)
+
+
+def build_system_prompt(summary: str) -> str:
+    """System prompt that keeps the model grounded in the data summary."""
+    return (
+        "You are a friendly data assistant for the CDC/NCHS provisional 2025 U.S. "
+        "natality (births) data shown in this dashboard.\n\n"
+        "Rules:\n"
+        "1. Answer ONLY from the DATA SUMMARY below. It reflects the user's current sidebar filters.\n"
+        "2. Values are raw birth COUNTS, not rates. When comparing states, remind the user "
+        "that population size drives the counts.\n"
+        "3. The data is provisional and may be revised.\n"
+        "4. If a question cannot be answered from the data (for example race, mother's age, "
+        "or other years), say so and suggest what data would be needed.\n"
+        "5. Use thousands separators, double-check arithmetic, and be concise.\n\n"
+        "DATA SUMMARY\n"
+        f"{summary}"
+    )
+
+
+def build_api_messages(history: list, summary: str) -> list:
+    """System prompt plus only the last few chat messages (error notices are skipped)."""
+    usable = [m for m in history if m.get("kind", "answer") == "answer"]
+    recent = usable[-MAX_HISTORY_MESSAGES:]
+    messages = [{"role": "system", "content": build_system_prompt(summary)}]
+    messages += [{"role": m["role"], "content": m["content"]} for m in recent]
+    return messages
+
+
+def open_chat_stream(client: Any, models: list, messages: list) -> Any:
+    """Open a streaming completion, falling back only when a model is unavailable."""
+    active = st.session_state.get("active_model")
+    ordered = ([active] if active in models else []) + [m for m in models if m != active]
+
+    last_error: Optional[Exception] = None
+    for model in ordered:
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": LLM_TEMPERATURE,
+            "max_tokens": LLM_MAX_TOKENS,
+            "stream": True,
+        }
+        if "gpt-oss" in model.lower():
+            kwargs["reasoning_effort"] = "low"
+        try:
+            stream = client.chat.completions.create(**kwargs)
+        except Exception as err:
+            if is_model_unavailable_error(err):
+                last_error = err
+                continue
+            raise
+        st.session_state["active_model"] = model
+        return stream
+
+    raise AllModelsUnavailableError(str(last_error)) from last_error
+
+
+def stream_text(stream: Any) -> Iterator[str]:
+    """Yield only the text deltas, skipping chunks that carry no choices."""
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        piece = chunk.choices[0].delta.content
+        if piece:
+            yield piece
+
+
+def friendly_error_message(err: Exception) -> str:
+    """Translate API failures into short, user-friendly messages."""
+    if isinstance(err, AllModelsUnavailableError):
+        return NONE_AVAILABLE_MESSAGE
+    status = getattr(err, "status_code", None)
+    text = str(err).lower()
+    if status == 401 or "invalid api key" in text or "invalid_api_key" in text:
+        return "The API key was rejected. Please check the key saved in your Streamlit Secrets."
+    if status == 429 or "rate limit" in text or "rate_limit" in text:
+        return "The free-tier rate limit was reached. Please wait a minute and try again."
+    return f"Sorry, something went wrong contacting the AI service: {err}"
+
+
+def answer_question(config: Dict[str, Any], filtered_df: pd.DataFrame) -> Dict[str, str]:
+    """Stream an answer for the latest question; never raises."""
+    try:
+        summary = build_data_summary(filtered_df)
+        messages = build_api_messages(st.session_state.messages, summary)
+        client = OpenAI(
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            timeout=60.0,
+            max_retries=1,
+        )
+        stream = open_chat_stream(client, config["models"], messages)
+        reply = st.write_stream(stream_text(stream))
+    except Exception as err:
+        message = friendly_error_message(err)
+        st.error(message)
+        return {"role": "assistant", "content": message, "kind": "error"}
+
+    reply = reply if isinstance(reply, str) else ""
+    if not reply.strip():
+        st.info(EMPTY_REPLY_MESSAGE)
+        return {"role": "assistant", "content": EMPTY_REPLY_MESSAGE, "kind": "notice"}
+    return {"role": "assistant", "content": reply, "kind": "answer"}
+
+
+def render_message(message: Dict[str, str]) -> None:
+    """Draw one stored chat message in the style matching its kind."""
+    kind = message.get("kind", "answer")
+    if kind == "error":
+        st.error(message["content"])
+    elif kind == "notice":
+        st.info(message["content"])
+    else:
+        st.markdown(message["content"])
+
+
+def render_chatbot(filtered_df: pd.DataFrame) -> None:
+    """Chat tab: ask questions about the data matching the sidebar filters."""
+    st.subheader("Ask the Data Assistant")
+
+    if OpenAI is None:
+        st.error(
+            "The `openai` package is not installed. Add `openai>=1.40.0` to "
+            "requirements.txt and redeploy."
+        )
+        return
+
+    api_key = get_llm_api_key()
+    if not api_key:
+        st.warning(
+            "No API key found, so the AI assistant is turned off. To enable it, add your "
+            "Groq key as `GROQ_API_KEY` in Streamlit Cloud: **⋮ → Settings → Secrets**, e.g. "
+            "`GROQ_API_KEY = \"gsk_...\"`, then save."
+        )
+        return
+
+    config = resolve_llm_config(api_key)
+    if config is None:
+        st.warning(
+            "The saved API key has an unrecognized prefix. Expected a Groq key (`gsk_`) or "
+            "an xAI key (`xai-`). Please check the key saved in your Streamlit Secrets."
+        )
+        return
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    caption_slot = st.empty()
+
+    def show_caption() -> None:
+        caption_slot.caption(
+            f"Powered by {config['provider']} · model {get_active_model(config)}. "
+            "Answers are based on the data matching your current sidebar filters. "
+            "AI can make mistakes — verify key numbers with the charts."
+        )
+
+    show_caption()
+
+    # Suggested questions + clear button
+    pending_question: Optional[str] = None
+    button_cols = st.columns(len(SUGGESTED_QUESTIONS) + 1)
+    for idx, (col, suggestion) in enumerate(zip(button_cols, SUGGESTED_QUESTIONS)):
+        if col.button(suggestion, key=f"suggested_q_{idx}", width="stretch"):
+            pending_question = suggestion
+    if button_cols[-1].button("🗑️ Clear chat", key="clear_chat", width="stretch"):
+        st.session_state.messages = []
+
+    # History is drawn in a container above the input box so new messages appear above it.
+    history_box = st.container()
+    typed_question = st.chat_input("Ask a question about the births data…")
+    question = pending_question or typed_question
+
+    with history_box:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                render_message(message)
+
+        if question:
+            st.session_state.messages.append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+            with st.chat_message("assistant"):
+                reply = answer_question(config, filtered_df)
+            st.session_state.messages.append(reply)
+            show_caption()
+
+
+# -----------------------------------------------------------------------------
+# 7. MAIN APPLICATION EXECUTION
 # -----------------------------------------------------------------------------
 
 def main():
@@ -399,7 +748,7 @@ def main():
 
     col_s_btn, _ = st.sidebar.columns([1, 1])
     with col_s_btn:
-        st.button("Select All States", on_click=select_all_states, use_container_width=True)
+        st.button("Select All States", on_click=select_all_states, width="stretch")
 
     st.sidebar.multiselect(
         "State / Geography",
@@ -410,7 +759,7 @@ def main():
 
     col_m_btn, _ = st.sidebar.columns([1, 1])
     with col_m_btn:
-        st.button("Select All Months", on_click=select_all_months, use_container_width=True)
+        st.button("Select All Months", on_click=select_all_months, width="stretch")
 
     st.sidebar.multiselect(
         "Month (Chronological)",
@@ -420,7 +769,7 @@ def main():
     )
 
     st.sidebar.markdown("---")
-    st.sidebar.button("Reset All Filters", on_click=reset_filters, use_container_width=True)
+    st.sidebar.button("Reset All Filters", on_click=reset_filters, width="stretch")
 
     st.sidebar.markdown("### Active Filters Summary")
     st.sidebar.caption(f"• **Sex:** {st.session_state.selected_sex}")
@@ -468,10 +817,11 @@ def main():
     st.markdown("---")
 
     # Tabs
-    tab_overview, tab_geo, tab_monthly_sex, tab_table, tab_about = st.tabs([
+    tab_overview, tab_geo, tab_monthly_sex, tab_chat, tab_table, tab_about = st.tabs([
         "Overview",
         "Geographic Analysis",
         "Monthly & Sex Analysis",
+        "🤖 Ask the Data (AI)",
         "Data Table & Download",
         "About the Data",
     ])
@@ -479,21 +829,24 @@ def main():
     with tab_overview:
         c1, c2 = st.columns([1, 1])
         with c1:
-            st.plotly_chart(plot_top_bottom_geographies(filtered_df, top_n=5), use_container_width=True)
+            st.plotly_chart(plot_top_bottom_geographies(filtered_df, top_n=5), width="stretch")
         with c2:
-            st.plotly_chart(plot_macro_trendline(filtered_df), use_container_width=True)
+            st.plotly_chart(plot_macro_trendline(filtered_df), width="stretch")
 
     with tab_geo:
         st.subheader("Geographic Distribution")
-        st.plotly_chart(plot_choropleth_map(filtered_df), use_container_width=True)
+        st.plotly_chart(plot_choropleth_map(filtered_df), width="stretch")
         st.markdown("#### State Volume Rankings")
-        st.plotly_chart(plot_state_rankings(filtered_df), use_container_width=True)
+        st.plotly_chart(plot_state_rankings(filtered_df), width="stretch")
 
     with tab_monthly_sex:
         st.subheader("Monthly Seasonality & Sex Breakdown")
-        st.plotly_chart(plot_monthly_sex_comparison(filtered_df), use_container_width=True)
+        st.plotly_chart(plot_monthly_sex_comparison(filtered_df), width="stretch")
         st.markdown("#### Geographic Seasonality Matrix")
-        st.plotly_chart(plot_state_month_heatmap(filtered_df), use_container_width=True)
+        st.plotly_chart(plot_state_month_heatmap(filtered_df), width="stretch")
+
+    with tab_chat:
+        render_chatbot(filtered_df)
 
     with tab_table:
         st.subheader("Searchable Filtered Records")
@@ -507,7 +860,7 @@ def main():
         })
         st.dataframe(
             display_df.style.format({"Birth Count": "{:,}"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         csv_buffer = display_df.to_csv(index=False).encode("utf-8")
